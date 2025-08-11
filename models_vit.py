@@ -107,7 +107,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         
         self.kl_loss = nn.KLDivLoss(reduction='none')
         # self.sos = torch.nn.Parameter(torch.rand(embed_dim), requires_grad=True)  # 시작 토큰
-        self.local_minima_constraint = True
+        self.local_minima_constraint = False
         self.use_register = True
         self.dynamic_pooling = True
         # self.energy_threshold = torch.tensor(0.0)
@@ -181,11 +181,6 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         self.entropy_maximization_loss = torch.sum(state_avg * torch.log(state_avg + eps), dim=-1) # (B,) entropy maximization
 
 
-        if self.local_minima_constraint:
-            energy_left_shift = torch.cat([self.energy[:, 1:], self.energy[:, :1]], dim=1)
-            energy_right_shift = torch.cat([self.energy[:, -1:], self.energy[:, :-1]], dim=1)
-            not_local_min = (self.energy > energy_right_shift) | (self.energy > energy_left_shift)
-
 
         
         margin_inference = 0.9
@@ -208,11 +203,53 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
 
         if self.local_minima_constraint:
-            survived = (self.energy >= estimated_threshold) # | (not_local_min)  # not_local_min의 부정  (이거 아무리 봐도 and여야할것 같은데)
-            # print("survived: ", survived)
-            # print("survived: ", survived.shape)  #  (B, T)
-            # print("survived: ", torch.all(survived))  
-            # survived = (self.energy >= estimated_threshold) | (~not_local_min)  # not_local_min의 부정
+            # Step 1: threshold보다 작은 패치들 제거
+            survived = self.energy >= estimated_threshold  # (B, N)
+            
+            # Step 2: 연속해서 제거된 영역에서 최고 에너지 패치 복구
+            # 2D grid로 변환
+            energy_2d = self.energy.view(B, H, W)  # (B, H, W)
+            survived_2d = survived.view(B, H, W)   # (B, H, W)
+            
+            for b in range(B):
+                # 각 배치별로 처리
+                energy_batch = energy_2d[b]     # (H, W)
+                survived_batch = survived_2d[b].clone()  # (H, W)
+                
+                # 간단한 상하좌우 확인으로 연속 제거 패치 복구
+                for i in range(H):
+                    for j in range(W):
+                        # 현재 패치가 제거된 경우에만 확인
+                        if not survived_batch[i, j]:
+                            # 상하좌우 이웃들의 상태 확인
+                            neighbors_removed = []
+                            neighbors_energy = []
+                            
+                            # 상하좌우 확인
+                            for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                                ni, nj = i + di, j + dj
+                                if 0 <= ni < H and 0 <= nj < W:
+                                    if not survived_batch[ni, nj]:  # 이웃도 제거됨
+                                        neighbors_removed.append((ni, nj))
+                                        neighbors_energy.append(energy_batch[ni, nj].item())
+                            
+                            # 연속해서 제거된 이웃이 있다면, 현재 패치와 이웃들 중 최고 에너지 패치를 살림
+                            if len(neighbors_removed) > 0:
+                                # 현재 패치도 후보에 추가
+                                all_candidates = [(i, j)] + neighbors_removed
+                                all_energies = [energy_batch[i, j].item()] + neighbors_energy
+                                
+                                # 최고 에너지 패치 찾기
+                                max_energy_idx = all_energies.index(max(all_energies))
+                                rescue_i, rescue_j = all_candidates[max_energy_idx]
+                                survived_batch[rescue_i, rescue_j] = True
+                
+                # 업데이트된 survived 상태를 다시 저장
+                survived_2d[b] = survived_batch
+            
+            # 최종 survived를 1D로 변환
+            survived = survived_2d.view(B, -1)
+
 
 
 
