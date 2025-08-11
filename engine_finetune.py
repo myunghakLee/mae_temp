@@ -55,6 +55,17 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         with torch.cuda.amp.autocast():
             outputs = model(samples)
             loss = criterion(outputs, targets)
+            
+            # Energy-based masking loss 추가
+            if hasattr(model, 'module'):  # DistributedDataParallel의 경우
+                energy_losses = model.module.get_energy_losses()
+            else:
+                energy_losses = model.get_energy_losses()
+            
+            # Energy loss들을 메인 loss에 추가 (작은 가중치)
+            energy_loss_weight = 1e-4
+            for loss_name, loss_value in energy_losses.items():
+                loss = loss + energy_loss_weight * loss_value
 
         loss_value = loss.item()
 
@@ -115,6 +126,17 @@ def evaluate(data_loader, model, device):
         with torch.cuda.amp.autocast():
             output = model(images)
             loss = criterion(output, target)
+            
+            # Energy-based masking loss 추가 (평가시에도 일관성 유지)
+            if hasattr(model, 'module'):  # DistributedDataParallel의 경우
+                energy_losses = model.module.get_energy_losses()
+            else:
+                energy_losses = model.get_energy_losses()
+            
+            # Energy loss들을 메인 loss에 추가 (작은 가중치)
+            energy_loss_weight = 1e-4
+            for loss_name, loss_value in energy_losses.items():
+                loss = loss + energy_loss_weight * loss_value
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
 

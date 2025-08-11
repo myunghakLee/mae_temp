@@ -375,7 +375,19 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         else:
             x = self.norm(x)
             outcome = x[:, 0]
+            
         return outcome
+    
+    def get_energy_losses(self):
+        """Energy-based masking에서 사용되는 추가 loss들을 반환"""
+        losses = {}
+        if hasattr(self, 'energy'):
+            losses['energy_loss'] = self.energy.mean()
+        if hasattr(self, 'state_prediction_loss'):
+            losses['state_prediction_loss'] = self.state_prediction_loss.mean()
+        if hasattr(self, 'entropy_maximization_loss'):
+            losses['entropy_maximization_loss'] = self.entropy_maximization_loss.mean()
+        return losses
     
     def forward(self, x, mask_ratio=0.0):
         """

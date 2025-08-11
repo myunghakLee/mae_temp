@@ -320,7 +320,7 @@ def main(args):
 
     # 분산 데이터 병렬 처리 설정
     if args.distributed:
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
 
     # 레이어별 학습률 감쇠를 사용한 옵티마이저 구성
