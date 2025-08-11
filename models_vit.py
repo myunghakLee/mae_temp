@@ -350,7 +350,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         if mask_ratio > 0:
             q, _, _ = self.energy_based_masking(x, mask_ratio)
             # print(f"patch : {x.shape} --> {q.shape}")
-            self.mask_ratio_history = q.shape[1] / x.shape[1]  # mask_ratio 기록(logging 용)
+            self.mask_ratio_history = (1 - q.shape[1] / x.shape[1])  # mask_ratio 기록(logging 용)
         else:
             q = x
         # 클래스 토큰 추가
