@@ -188,7 +188,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         # if True:
         if self.training:
             # 이미지에서는 transcript_len을 패치 개수 기준으로 설정
-            self.transcript_len = int(N * (1 * self.mask_ratio))  # 유지할 최소 패치 수
+            self.transcript_len = int(N * (1 - self.mask_ratio))  # 유지할 최소 패치 수
             self.signal_len = N  # 전체 패치 수
             self.max_pruning_rate = 0.8  # 최대 80%까지 제거 가능
             self.padding_value = None  # 이미지에서는 패딩값 없음
@@ -205,7 +205,8 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
         if self.local_minima_constraint:
             # Step 1: threshold보다 작은 패치들 제거
-            survived = self.energy >= estimated_threshold  # (B, N)
+            # estimated_threshold: (B,) -> (B, 1)로 확장하여 브로드캐스팅
+            survived = self.energy >= estimated_threshold.unsqueeze(1)  # (B, N)
             
             # Step 2: 연속해서 제거된 영역에서 최고 에너지 패치 복구
             # 2D grid로 변환
@@ -255,7 +256,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
 
         else:
-            survived = self.energy >= estimated_threshold
+            survived = self.energy >= estimated_threshold.unsqueeze(1)  # (B, N)
             survived = survived == 1
         length_pruned = survived.sum(dim=1) # (B,) number-of tokens survived after pruning
 
@@ -269,7 +270,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         batch_indices = []
         for b in range(survived.size(0)):
             survived_indices = torch.where(survived[b])[0]
-            # print(f"{b}: survived_indices : {survived_indices.shape}")
+            # print(f"{b}: survived_indices : {survived_indices.shape},{max_survived}")
             if len(survived_indices) < max_survived:
                 # 부족한 부분은 마지막 인덱스로 패딩
                 pad_size = max_survived - len(survived_indices)
@@ -289,12 +290,14 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
         if self.energy_threshold == 0.0: 
             with torch.no_grad():
-                self.energy_threshold.add_(estimated_threshold.detach())
+                # 배치별 threshold의 평균을 사용
+                self.energy_threshold.add_(estimated_threshold.mean().detach())
                 # self.energy threshold - estimated threshold.detach()
         else:
             with torch.no_grad():
                 momentum = 0.99
-                self.energy_threshold.mul_(momentum).add_((1-momentum) * estimated_threshold.detach()) # exponential moving average #self.energy_threshold = 0.99 * self.energy_threshold + 0.01 * estimated_threshold.detach() #•exponential moving average
+                # 배치별 threshold의 평균을 사용
+                self.energy_threshold.mul_(momentum).add_((1-momentum) * estimated_threshold.mean().detach()) # exponential moving average #self.energy_threshold = 0.99 * self.energy_threshold + 0.01 * estimated_threshold.detach() #•exponential moving average
 
 
         if self.use_register and x.shape[1] < N: # 하나도 제거되지 않은 경우는 예외
@@ -323,22 +326,35 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
 
     def estimate_min_threshold(self, transcript_len, energy, max_pruning_rate=1.0, padding_value=None):
-        # 최종적인인 thresho1d를 계산하는 함수
-        #• Find the minimum energy threshold that covers the given transcript length
-        sorted_energy = energy.sort(dim=1, descending=True).values
-        transcription_threshold = sorted_energy[torch.arange(energy.size(0)), transcript_len]
-        transcription_threshold = transcription_threshold.min()
-        assert 0 <= max_pruning_rate <= 1.0, "max_pruning_rate must be within [0, 1]"
-        if max_pruning_rate < 1.0:
-            energy = energy.view(-1)
-            # energy = energy[energy != padding_value]
-            energy = energy.sort(dim=0, descending=True).values
-            num_tokens_pruned = int(len(energy) * max_pruning_rate)
-            ratio_threshold = energy[-num_tokens_pruned]
-
-        # print("transcription_threshold: ", transcription_threshold)
-        # print("ratio_threshold: ", ratio_threshold)
-        return min(transcription_threshold, ratio_threshold)
+        # 각 배치별로 개별 threshold를 계산하는 함수
+        #• Find the minimum energy threshold that covers the given transcript length for each batch
+        B, N = energy.shape
+        batch_thresholds = []
+        
+        for b in range(B):
+            energy_batch = energy[b]  # (N,) - 하나의 배치 데이터
+            
+            # 1. Transcription threshold: 최소 transcript_len개 패치 유지
+            sorted_energy_batch = energy_batch.sort(descending=True).values
+            transcription_threshold = sorted_energy_batch[transcript_len]
+            
+            # 2. Max pruning rate threshold: 최대 제거율 제한
+            assert 0 <= max_pruning_rate <= 1.0, "max_pruning_rate must be within [0, 1]"
+            if max_pruning_rate < 1.0:
+                num_tokens_pruned = int(N * max_pruning_rate)
+                ratio_threshold = sorted_energy_batch[-num_tokens_pruned]
+            else:
+                ratio_threshold = float('inf')  # 제한 없음
+            
+            # 두 제약 조건 중 더 엄격한(높은) threshold 선택
+            batch_threshold = min(transcription_threshold, ratio_threshold)
+            batch_thresholds.append(batch_threshold)
+        
+        # 각 배치별 threshold를 텐서로 변환 (B,)
+        thresholds = torch.stack(batch_thresholds)
+        
+        # print("batch_thresholds: ", thresholds)
+        return thresholds
 
 
     def random_masking(self, x, mask_ratio):
