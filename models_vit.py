@@ -115,6 +115,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         self.max_pruning_rate = 0.5
 
         self.register_token = nn.Parameter(torch.rand(self.d_model), requires_grad=True)  # ??????????????
+        self.mask_ratio_history_list = []
         self.mask_ratio_history = 1.0
 
     def energy_based_masking(self, x, mask_ratio):
@@ -387,7 +388,8 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         if mask_ratio > 0:
             q, _, _ = self.energy_based_masking(x, mask_ratio)
             # print(f"patch : {x.shape} --> {q.shape}")
-            self.mask_ratio_history = (1 - q.shape[1] / x.shape[1])  # mask_ratio 기록(logging 용)
+            self.mask_ratio_history_list.append(1 - q.shape[1] / x.shape[1])  # mask_ratio 기록(logging 용)
+            self.mask_ratio_history = sum(self.mask_ratio_history_list[-20:]) / len(self.mask_ratio_history_list[-20:])  # 평균 mask_ratio
         else:
             q = x
         # 클래스 토큰 추가
