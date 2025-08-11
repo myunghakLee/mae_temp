@@ -321,6 +321,8 @@ def main(args):
     # 분산 데이터 병렬 처리 설정
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
+        # Static graph 설정으로 DDP 오류 방지
+        model._set_static_graph()
         model_without_ddp = model.module
 
     # 레이어별 학습률 감쇠를 사용한 옵티마이저 구성

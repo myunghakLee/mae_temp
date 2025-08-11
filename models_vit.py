@@ -133,7 +133,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
 
         ################# For energy-based masking
-        state = self.state_vectors(x.detach())
+        state = self.state_vectors(x)  # detach() 제거로 gradient flow 일관성 유지
         state = torch.nn.functional.softmax(state, dim=-1)
 
         # 2D 위치 정보를 고려한 주변 패치 예측
