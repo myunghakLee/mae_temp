@@ -30,6 +30,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     model.train(True)
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
+    metric_logger.add_meter('mask_ratio_history', misc.SmoothedValue(window_size=1, fmt='{value:.4f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 20
 
@@ -83,6 +84,14 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         torch.cuda.synchronize()
 
         metric_logger.update(loss=loss_value)
+        
+        # mask_ratio_history 업데이트
+        if hasattr(model, 'module'):  # DistributedDataParallel의 경우
+            mask_ratio_history = model.module.mask_ratio_history
+        else:
+            mask_ratio_history = model.mask_ratio_history
+        metric_logger.update(mask_ratio_history=mask_ratio_history)
+        
         min_lr = 10.
         max_lr = 0.
         for group in optimizer.param_groups:
@@ -99,6 +108,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             epoch_1000x = int((data_iter_step / len(data_loader) + epoch) * 1000)
             log_writer.add_scalar('loss', loss_value_reduce, epoch_1000x)
             log_writer.add_scalar('lr', max_lr, epoch_1000x)
+            # metric_logger.meters['mask_ratio_history'].update(model.mask_ratio_history, n=batch_size)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
