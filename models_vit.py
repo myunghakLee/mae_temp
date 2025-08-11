@@ -189,8 +189,8 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
         
         margin_inference = 0.9
-        if True:
-        # if self.training:
+        # if True:
+        if self.training:
             # 이미지에서는 transcript_len을 패치 개수 기준으로 설정
             self.transcript_len = int(N * (1 * self.mask_ratio))  # 유지할 최소 패치 수
             self.signal_len = N  # 전체 패치 수
