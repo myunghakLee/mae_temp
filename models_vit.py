@@ -107,7 +107,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         
         self.kl_loss = nn.KLDivLoss(reduction='none')
         # self.sos = torch.nn.Parameter(torch.rand(embed_dim), requires_grad=True)  # 시작 토큰
-        self.local_minima_constraint = False
+        self.local_minima_constraint = True
         self.use_register = True
         self.dynamic_pooling = True
         # self.energy_threshold = torch.tensor(0.0)
@@ -256,7 +256,14 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
 
         else:
-            survived = self.energy >= estimated_threshold.unsqueeze(1)  # (B, N)
+            # print(estimated_threshold.shape, self.energy.shape)
+            if self.training:
+                survived = self.energy >= estimated_threshold.unsqueeze(1)  # (B, N)
+                # print("survived", survived.shape)
+            else:
+                survived = self.energy >= estimated_threshold
+                # print("survived: ", survived.shape)
+                
             survived = survived == 1
         length_pruned = survived.sum(dim=1) # (B,) number-of tokens survived after pruning
 
@@ -274,8 +281,13 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             if len(survived_indices) < max_survived:
                 # 부족한 부분은 마지막 인덱스로 패딩
                 pad_size = max_survived - len(survived_indices)
-                survived_indices = torch.cat([survived_indices, survived_indices[-1:].repeat(pad_size)])
-            elif len(survived_indices) > max_survived:
+                # survived_indices = torch.cat([survived_indices, survived_indices[-1:].repeat(pad_size)])
+                pad_tensor = torch.zeros(pad_size, dtype=survived_indices.dtype,
+                              device=survived_indices.device)
+
+                survived_indices = torch.cat([survived_indices, pad_tensor])
+
+            elif len(survived_indices) > max_survived:  # 아마 여기에 들어갈일은 없을것 같은데 한번 테스트 해봐야 함
                 # 너무 많으면 자르기
                 survived_indices = survived_indices[:max_survived]
             # print(f"{b}: survived_indices2 : {survived_indices.shape}")
