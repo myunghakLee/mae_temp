@@ -160,6 +160,7 @@ def get_args_parser():
     parser.add_argument('--dist_on_itp', action='store_true')
     parser.add_argument('--dist_url', default='env://',
                         help='분산 훈련 설정에 사용되는 URL')
+    parser.add_argument('--mask_ratio', required=True, type=float)
 
     return parser
 
@@ -351,7 +352,7 @@ def main(args):
 
     # 평가만 수행하는 경우
     if args.eval:
-        test_stats = evaluate(data_loader_val, model, device)
+        test_stats = evaluate(data_loader_val, model, device, args.mask_ratio)
         print(f"네트워크의 {len(dataset_val)}개 테스트 이미지에 대한 정확도: {test_stats['acc1']:.1f}%")
         exit(0)
 
@@ -382,7 +383,7 @@ def main(args):
                 loss_scaler=loss_scaler, epoch=epoch)
 
         # 검증 세트에서 평가
-        test_stats = evaluate(data_loader_val, model, device)
+        test_stats = evaluate(data_loader_val, model, device, args.mask_ratio)
         print(f"네트워크의 {len(dataset_val)}개 테스트 이미지에 대한 정확도: {test_stats['acc1']:.1f}%")
         max_accuracy = max(max_accuracy, test_stats["acc1"])
         print(f'최대 정확도: {max_accuracy:.2f}%')

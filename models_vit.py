@@ -412,9 +412,10 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         B = x.shape[0]
         x = self.patch_embed(x)
         x = x + self.pos_embed[:, 1:, :]
-        mask_ratio = 0.9
+        # mask_ratio = 0.2
         if mask_ratio > 0:
-            q, _, _ = self.energy_based_masking(x, mask_ratio)
+            q, _, _ = self.random_masking(x, mask_ratio)
+            # q, _, _ = self.energy_based_masking(x, mask_ratio)
             # print(f"patch : {x.shape} --> {q.shape}")
             self.mask_ratio_history_list.append(1 - q.shape[1] / x.shape[1])  # mask_ratio 기록(logging 용)
             self.mask_ratio_history = sum(self.mask_ratio_history_list[-20:]) / len(self.mask_ratio_history_list[-20:])  # 평균 mask_ratio
