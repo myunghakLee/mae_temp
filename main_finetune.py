@@ -185,6 +185,7 @@ def main(args):
     cudnn.benchmark = True  # CuDNN 성능 최적화
 
     # 훈련 및 검증 데이터셋 구성
+    assert 0<= args.mask_ratio <= 1, "mask_ratio는 0과 1 사이여야 합니다."
     dataset_train = build_dataset(is_train=True, args=args)
     dataset_val = build_dataset(is_train=False, args=args)
 

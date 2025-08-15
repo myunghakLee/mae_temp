@@ -31,6 +31,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', misc.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     metric_logger.add_meter('mask_ratio_history', misc.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+    metric_logger.add_meter('energy_loss_history', misc.SmoothedValue(window_size=1, fmt='{value:.4f}'))
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 20
 
@@ -88,10 +89,16 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         # mask_ratio_history 업데이트
         if hasattr(model, 'module'):  # DistributedDataParallel의 경우
             mask_ratio_history = model.module.mask_ratio_history
+            energy_loss_history = model.module.energy_loss_history
         else:
             mask_ratio_history = model.mask_ratio_history
+            energy_loss_history = model.energy_loss_history
+
         metric_logger.update(mask_ratio_history=mask_ratio_history)
-        
+        metric_logger.update(energy_loss_history=energy_loss_history)
+
+
+
         min_lr = 10.
         max_lr = 0.
         for group in optimizer.param_groups:
