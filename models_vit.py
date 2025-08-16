@@ -175,10 +175,6 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
         H_p, W_p = self.patch_H, self.patch_W
 
-        # CLS 토큰 제거 (이미 없던데...)
-        if N == 1 + H_p * W_p:
-            x = x[:, 1:, :]
-            N = H_p * W_p
 
         assert N == H_p * W_p, f"Patch 수 불일치: N={N}, grid={H_p}x{W_p}"
 
@@ -217,7 +213,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             
             energy_ = energy.clone()
             energy_[:, keep_idx] = float('-inf')  # keep_idx 위치의 energy를 -inf로 설정
-            _, keep_idx = torch.topk(energy_, k=int(len(energy_) * keep_ratio), dim=1)
+            _, keep_idx = torch.topk(energy_, k=int(len(energy_[0]) * keep_ratio), dim=1)
 
         else:
             _, keep_idx = torch.topk(energy, k= len(energy[0]) * keep_ratio, dim=1)
@@ -225,38 +221,6 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         keep_mask = torch.zeros(len(x[1]), dtype=torch.bool)
         keep_mask[keep_idx] = True
         return x[:, keep_mask, :], -1, -1, energy
-
-
-    def estimate_min_threshold(self, transcript_len, energy, max_pruning_rate=1.0, padding_value=None):
-        # 각 배치별로 개별 threshold를 계산하는 함수
-        #• Find the minimum energy threshold that covers the given transcript length for each batch
-        B, N = energy.shape
-        batch_thresholds = []
-        
-        for b in range(B):
-            energy_batch = energy[b]  # (N,) - 하나의 배치 데이터
-            
-            # 1. Transcription threshold: 최소 transcript_len개 패치 유지
-            sorted_energy_batch = energy_batch.sort(descending=True).values
-            transcription_threshold = sorted_energy_batch[transcript_len]
-            
-            # 2. Max pruning rate threshold: 최대 제거율 제한
-            assert 0 <= max_pruning_rate <= 1.0, "max_pruning_rate must be within [0, 1]"
-            if max_pruning_rate < 1.0:
-                num_tokens_pruned = int(N * max_pruning_rate)
-                ratio_threshold = sorted_energy_batch[-num_tokens_pruned]
-            else:
-                ratio_threshold = float('inf')  # 제한 없음
-            
-            # 두 제약 조건 중 더 엄격한(높은) threshold 선택
-            batch_threshold = min(transcription_threshold, ratio_threshold)
-            batch_thresholds.append(batch_threshold)
-        
-        # 각 배치별 threshold를 텐서로 변환 (B,)
-        thresholds = torch.stack(batch_thresholds)
-        
-        # print("batch_thresholds: ", thresholds)
-        return thresholds
 
 
     def random_masking(self, x, mask_ratio):
@@ -280,7 +244,10 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
         # 유지할 패치들만 선택
         ids_keep = ids_shuffle[:, :len_keep]
+        # print("x : ", x.shape)
         x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+        # print("x_masked : ", x_masked.shape)
+        # print("ids_keep: ", ids_keep.shape)
 
         # 바이너리 마스크 생성
         mask = torch.ones([N, L], device=x.device)
@@ -305,6 +272,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         # mask_ratio = 0.2
         if mask_ratio > 0:
             # q, _, _ = self.random_masking(x, mask_ratio)
+            # energy = torch.zeros_like(q)
             q, _, _ , energy = self.energy_based_masking(x, mask_ratio)
             # print(f"patch : {x.shape} --> {q.shape}")
             self.mask_ratio_history_list.append(1 - q.shape[1] / x.shape[1])  # mask_ratio 기록(logging 용)
