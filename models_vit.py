@@ -143,7 +143,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
         # i+j 홀수인 마스크 생성. 단 1자로 쭉 폈을 때 끼준
 
-
+        self.device = None
         mask1 = self.get_checkerboard_mask(0)
         mask2 = self.get_checkerboard_mask(1)
         self.checker_masking = torch.stack([mask1, mask2])
@@ -161,33 +161,36 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         (W, H) 격자에서 (i + j) % 2 == flag 인 위치를
         flatten(view(-1)) 순서(행우선, flat_idx = i*H + j) 기준 불리언 마스크로 반환.
         """
-        device = device or getattr(self, "device", "cpu")
+
         # i: 행(0..W-1), j: 열(0..H-1)  → n = i*H + j  (W가 바깥, H가 안쪽)
         i = torch.arange(self.patch_W, device=device).unsqueeze(1)   # (W,1)
         j = torch.arange(self.patch_H, device=device).unsqueeze(0)   # (1,H)
+        
+        
         mask_2d = ((i + j) % 2 == flag)                              # (W,H) bool
+
         return mask_2d.view(-1)                                      # (W*H,) bool
 
 
     def calc_energy(self, x): # x shape: batch_num, patch_num, emb_dim
-        H, W = self.img_size
-        B, N, D = x.shape
+        B, L, D = x.shape
 
         H_p, W_p = self.patch_H, self.patch_W
 
 
-        assert N == H_p * W_p, f"Patch 수 불일치: N={N}, grid={H_p}x{W_p}"
+        assert L == H_p * W_p, f"Patch 수 불일치: N={L}, grid={H_p}x{W_p}"
 
         x_2d = x.reshape(B, H_p, W_p, D).permute(0, 3, 1, 2).contiguous() # (B, N, D) -> (B, D, H_p, W_p)
 
         # 패치별 에너지 계산 (MAE 스타일)
 
-        out_2d = self.pred_conv(x_2d)  # (B, D, H_p, W_p)
+        pred_2d = self.pred_conv(x_2d)  # (B, D, H_p, W_p)
+        pred = pred_2d.permute(0, 2, 3, 1).reshape(B, L, D)
 
-        out = out_2d.permute(0, 2, 3, 1).reshape(B, N, D)  # (B, D, H_p, W_p) -> (B, N, D)
-        energy = F.cosine_similarity(x.float(), out.float(), dim=-1)  # (B, N)
+        cos = F.cosine_similarity(x.float(), pred.float(), dim=-1)
+        rec_loss = (1.0 - cos).mean() + F.l1_loss(pred, x, reduction='mean')
 
-        return energy
+        return rec_loss, cos
 
     def energy_based_masking(self, x, mask_ratio):
         # print("x shape: ", x.shape)  # batch_num, patch_num, emb_dim
@@ -200,27 +203,34 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             mask: 바이너리 마스크 (0=keep, 1=remove)
             ids_restore: 복원을 위한 인덱스
         """
-        N, L, D = x.shape  # batch, length, dim
-        len_keep = self.dynamic_pooling_codebook_size
+        B, L, D = x.shape  # batch, length, dim
+        keep_ratio = 1.0 - mask_ratio
+        k = max(1, int(round(L * keep_ratio)))
+        rec_loss, cos = self.calc_energy(x)
 
-        energy = self.calc_energy(x)  # (B, N)
-        keep_ratio = 1 - mask_ratio
+        score = rec_loss
+
 
         if self.local_minima_constraint:
-            keep_idx = self.checker_masking[random.randint(0,1)].nonzero(as_tuple=False)
+            if not self.device:
+                self.device = score.device
+                self.checker_masking = self.checker_masking.to(device=self.device)
+            parity = self.checker_masking[random.randint(0,1)].unsqueeze(0)
             # keep_ratio -=  len(keep_idx) / len(energy[0])
             assert keep_ratio >= 0.5, f"mask_ratio must be smaller than 0.5, got {mask_ratio}"
-            
-            energy_ = energy.clone()
-            energy_[:, keep_idx] = float('-inf')  # keep_idx 위치의 energy를 -inf로 설정
-            _, keep_idx = torch.topk(energy_, k=int(len(energy_[0]) * keep_ratio), dim=1)
+            k1 = k // 2
+            k2 = k - k1
+            idx1 = score.masked_fill(parity, float('inf')).topk(k1, dim=1).indices  # parity가 true인거 다뽑음
+            idx2 = score.masked_fill(parity, float('-inf')).topk(k2, dim=1).indices # parity가 true인거 뽑지 않음
+            keep_idx = torch.cat([idx1, idx2], dim=1)                          # [B, k]
 
         else:
-            _, keep_idx = torch.topk(energy, k= len(energy[0]) * keep_ratio, dim=1)
+            keep_idx = score.topk(k, dim=1).indices
 
-        keep_mask = torch.zeros(len(x[1]), dtype=torch.bool)
-        keep_mask[keep_idx] = True
-        return x[:, keep_mask, :], -1, -1, energy
+        x_kept = torch.gather(x, 1, keep_idx.unsqueeze(-1).expand(B, k, D))
+
+        return x_kept, keep_idx, rec_loss, cos
+
 
 
     def random_masking(self, x, mask_ratio):
@@ -273,11 +283,11 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         if mask_ratio > 0:
             # q, _, _ = self.random_masking(x, mask_ratio)
             # energy = torch.zeros_like(q)
-            q, _, _ , energy = self.energy_based_masking(x, mask_ratio)
+            q, keep_idx, rec_loss, cos = self.energy_based_masking(x, mask_ratio)
             # print(f"patch : {x.shape} --> {q.shape}")
             self.mask_ratio_history_list.append(1 - q.shape[1] / x.shape[1])  # mask_ratio 기록(logging 용)
             self.mask_ratio_history = sum(self.mask_ratio_history_list[-20:]) / len(self.mask_ratio_history_list[-20:])  # 평균 mask_ratio
-            self.energy_loss_history_list.append(energy.mean().item())  # energy 기록(logging 용)
+            self.energy_loss_history_list.append(rec_loss.item())  # energy 기록(logging 용)
             self.energy_loss_history = sum(self.energy_loss_history_list[-20:]) / len(self.energy_loss_history_list[-20:])  # 평균 energy
 
         else:
@@ -305,7 +315,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             x = self.norm(x)
             outcome = x[:, 0]
             
-        return outcome
+        return outcome, rec_loss
     
     def get_energy_losses(self):
         """Energy-based masking에서 사용되는 추가 loss들을 반환"""
@@ -329,10 +339,10 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         """
         # print(f"mask_ratio : ", mask_ratio)
         # 특징 추출 (마스킹 적용 가능)
-        x = self.forward_features(x, mask_ratio)
+        x, rec_loss = self.forward_features(x, mask_ratio)
         # 분류 헤드 통과
         x = self.head(x)
-        return x
+        return x, rec_loss
 
 
 def vit_base_patch16(**kwargs):

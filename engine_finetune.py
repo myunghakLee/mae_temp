@@ -55,19 +55,12 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             samples, targets = mixup_fn(samples, targets)
 
         with torch.cuda.amp.autocast():
-            outputs = model(samples, args.mask_ratio)
+            outputs, rec_loss = model(samples, args.mask_ratio)
             loss = criterion(outputs, targets)
             
-            # Energy-based masking loss 추가
-            if hasattr(model, 'module'):  # DistributedDataParallel의 경우
-                energy_losses = model.module.get_energy_losses()
-            else:
-                energy_losses = model.get_energy_losses()
-            
             # Energy loss들을 메인 loss에 추가 (작은 가중치)
-            energy_loss_weight = 1e-4
-            for loss_name, loss_value in energy_losses.items():
-                loss = loss + energy_loss_weight * loss_value
+            energy_loss_weight = 1e-1
+            loss = loss + energy_loss_weight * rec_loss
 
         loss_value = loss.item()
 
@@ -116,7 +109,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             log_writer.add_scalar('loss', loss_value_reduce, epoch_1000x)
             log_writer.add_scalar('lr', max_lr, epoch_1000x)
             # metric_logger.meters['mask_ratio_history'].update(model.mask_ratio_history, n=batch_size)
-
+            
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -141,19 +134,11 @@ def evaluate(data_loader, model, device, mask_ratio):
 
         # compute output
         with torch.cuda.amp.autocast():
-            output = model(images, mask_ratio)
+            output, rec_loss = model(images, mask_ratio)
             loss = criterion(output, target)
             
-            # Energy-based masking loss 추가 (평가시에도 일관성 유지)
-            if hasattr(model, 'module'):  # DistributedDataParallel의 경우
-                energy_losses = model.module.get_energy_losses()
-            else:
-                energy_losses = model.get_energy_losses()
-            
-            # Energy loss들을 메인 loss에 추가 (작은 가중치)
-            energy_loss_weight = 1e-4
-            for loss_name, loss_value in energy_losses.items():
-                loss = loss + energy_loss_weight * loss_value
+            energy_loss_weight = 1e-1
+            loss = loss + energy_loss_weight * rec_loss
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
@@ -161,6 +146,9 @@ def evaluate(data_loader, model, device, mask_ratio):
         metric_logger.update(loss=loss.item())
         metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
         metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+        metric_logger.meters['rec_loss'].update(rec_loss.item(), n=batch_size)
+        # metric_logger.add_meter('mask_ratio_history', misc.SmoothedValue(window_size=1, fmt='{value:.4f}'))
+        # metric_logger.add_meter('energy_loss_history', misc.SmoothedValue(window_size=1, fmt='{value:.4f}'))
 
         if hasattr(model, 'module'):  # DistributedDataParallel의 경우
             mask_ratio_history = model.module.mask_ratio_history
