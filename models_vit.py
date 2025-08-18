@@ -243,7 +243,6 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
         x_kept = torch.gather(x, 1, keep_idx.unsqueeze(-1).expand(B, k, D))
         rec_loss = rec_loss.mean()
-        print("rec_loss: ", rec_loss)
         return x_kept, keep_idx, rec_loss, cos
 
 
