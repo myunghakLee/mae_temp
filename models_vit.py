@@ -103,7 +103,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
 
         ################# For energy-based masking ####################
-        self.mask_ratio = 0.5
+        self.mask_ratio = mask_ratio
         self.d_model = embed_dim
         self.dynamic_pooling_codebook_size = int((1-self.mask_ratio) * self.d_model)
         self.local_minima_constraint = True
@@ -118,16 +118,16 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         self.patch_size = kwargs.get('patch_size', 16)
         H, W = self.img_size
         self.patch_H, self.patch_W = H // self.patch_size, W // self.patch_size
-        i_idx = torch.arange(H // self.patch_size).unsqueeze(1)   # shape: (40, 1)
-        j_idx = torch.arange(W // self.patch_size).unsqueeze(0)   # shape: (1, 40)
-        mask_0 = (i_idx + j_idx) % 2  # checkerboard pattern
-        mask_1 = 1 - mask_0
+        # i_idx = torch.arange(H // self.patch_size).unsqueeze(1)   # shape: (40, 1)
+        # j_idx = torch.arange(W // self.patch_size).unsqueeze(0)   # shape: (1, 40)
+        # mask_0 = (i_idx + j_idx) % 2  # checkerboard pattern
+        # mask_1 = 1 - mask_0
 
         self.state_vectors = torch.nn.Linear(self.d_model, self.dynamic_pooling_codebook_size)
         self.sos = torch.nn.Parameter(torch.rand(embed_dim), requires_grad=True)  # 시작 토큰
         # self.energy_threshold = torch.tensor(0.0)
         self.register_buffer("energy_threshold", torch.tensor(0.0), persistent=True)
-        self.register_token = nn.Parameter(torch.rand(self.d_model), requires_grad=True)  # ??????????????
+        self.register_token = nn.Parameter(torch.rand(self.d_model), requires_grad=True) 
         num_patches = (H // self.patch_size) * (W // self.patch_size)
 
         # Ver 2: Using MAE Loss using Conv Layer
@@ -192,7 +192,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
         return rec_loss, cos
 
-    def energy_based_masking(self, x, mask_ratio):
+    def energy_based_masking(self, x):
         # print("x shape: ", x.shape)  # batch_num, patch_num, emb_dim
         """
         패치별 energy based 마스킹 수행 (MAE 스타일)
@@ -204,7 +204,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             ids_restore: 복원을 위한 인덱스
         """
         B, L, D = x.shape  # batch, length, dim
-        keep_ratio = 1.0 - mask_ratio
+        keep_ratio = 1.0 - self.mask_ratio
         k = max(1, int(round(L * keep_ratio)))
         rec_loss, cos = self.calc_energy(x)
 
@@ -217,7 +217,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
                 self.checker_masking = self.checker_masking.to(device=self.device)
             parity = self.checker_masking[random.randint(0,1)].unsqueeze(0)
             # keep_ratio -=  len(keep_idx) / len(energy[0])
-            assert keep_ratio >= 0.5, f"mask_ratio must be smaller than 0.5, got {mask_ratio}"
+            assert keep_ratio >= 0.5, f"mask_ratio must be smaller than 0.5, got {self.mask_ratio}"
             k1 = k // 2
             k2 = k - k1
             idx1 = score.masked_fill(parity, float('inf')).topk(k1, dim=1).indices  # parity가 true인거 다뽑음
@@ -266,7 +266,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
         return x_masked, mask, ids_restore
 
-    def forward_features(self, x, mask_ratio=0.0):
+    def forward_features(self, x):
         """
         Vision Transformer의 특징 추출 함수 (Q, K, V를 외부에서 입력 가능)
         Args:
@@ -280,12 +280,16 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         x = self.patch_embed(x) # (4, 196, 768)
         x = x + self.pos_embed[:, 1:, :]
         # mask_ratio = 0.2
-        if mask_ratio > 0:
+        if self.mask_ratio > 0:
             # q, _, _ = self.random_masking(x, mask_ratio)
             # energy = torch.zeros_like(q)
-            q, keep_idx, rec_loss, cos = self.energy_based_masking(x, mask_ratio)
+            q, keep_idx, rec_loss, cos = self.energy_based_masking(x)
+            patch_length = q.shape[1]
+            if self.use_register:
+                register_token = self.register_token.unsqueeze(0).unsqueeze(1).repeat(q.size(0), 1, 1) 
+                q = torch.cat([register_token, q], dim=1)
             # print(f"patch : {x.shape} --> {q.shape}")
-            self.mask_ratio_history_list.append(1 - q.shape[1] / x.shape[1])  # mask_ratio 기록(logging 용)
+            self.mask_ratio_history_list.append(1 - patch_length / x.shape[1])  # mask_ratio 기록(logging 용)
             self.mask_ratio_history = sum(self.mask_ratio_history_list[-20:]) / len(self.mask_ratio_history_list[-20:])  # 평균 mask_ratio
             self.energy_loss_history_list.append(rec_loss.item())  # energy 기록(logging 용)
             self.energy_loss_history = sum(self.energy_loss_history_list[-20:]) / len(self.energy_loss_history_list[-20:])  # 평균 energy
@@ -328,7 +332,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             losses['entropy_maximization_loss'] = self.entropy_maximization_loss.mean()
         return losses
     
-    def forward(self, x, mask_ratio=0.0):
+    def forward(self, x):
         """
         Vision Transformer 순전파 (마스킹 지원)
         Args:
@@ -339,7 +343,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         """
         # print(f"mask_ratio : ", mask_ratio)
         # 특징 추출 (마스킹 적용 가능)
-        x, rec_loss = self.forward_features(x, mask_ratio)
+        x, rec_loss = self.forward_features(x)
         # 분류 헤드 통과
         x = self.head(x)
         return x, rec_loss

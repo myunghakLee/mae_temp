@@ -249,6 +249,7 @@ def main(args):
         num_classes=args.nb_classes,
         drop_path_rate=args.drop_path,
         global_pool=args.global_pool,
+        mask_ratio=args.mask_ratio,
     )
 
     # 사전 훈련된 체크포인트에서 파인튜닝
@@ -384,7 +385,7 @@ def main(args):
                 loss_scaler=loss_scaler, epoch=epoch)
 
         # 검증 세트에서 평가
-        test_stats = evaluate(data_loader_val, model, device, args.mask_ratio)
+        test_stats = evaluate(data_loader_val, model, device)
         print(f"네트워크의 {len(dataset_val)}개 테스트 이미지에 대한 정확도: {test_stats['acc1']:.1f}%")
         max_accuracy = max(max_accuracy, test_stats["acc1"])
         print(f'최대 정확도: {max_accuracy:.2f}%')

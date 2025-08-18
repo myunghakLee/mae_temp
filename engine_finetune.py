@@ -43,7 +43,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         print('log_dir: {}'.format(log_writer.log_dir))
 
     for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
-
+            
         # we use a per iteration (instead of per epoch) lr scheduler
         if data_iter_step % accum_iter == 0:
             lr_sched.adjust_learning_rate(optimizer, data_iter_step / len(data_loader) + epoch, args)
@@ -55,7 +55,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             samples, targets = mixup_fn(samples, targets)
 
         with torch.cuda.amp.autocast():
-            outputs, rec_loss = model(samples, args.mask_ratio)
+            outputs, rec_loss = model(samples)
             loss = criterion(outputs, targets)
             
             # Energy loss들을 메인 loss에 추가 (작은 가중치)
@@ -117,7 +117,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def evaluate(data_loader, model, device, mask_ratio):
+def evaluate(data_loader, model, device):
     criterion = torch.nn.CrossEntropyLoss()
 
     metric_logger = misc.MetricLogger(delimiter="  ")
@@ -134,7 +134,7 @@ def evaluate(data_loader, model, device, mask_ratio):
 
         # compute output
         with torch.cuda.amp.autocast():
-            output, rec_loss = model(images, mask_ratio)
+            output, rec_loss = model(images)
             loss = criterion(output, target)
             
             energy_loss_weight = 1e-1
