@@ -223,12 +223,12 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             # idx1 = score.masked_fill(parity, float('inf')).topk(k1, dim=1).indices  # parity가 true인거 다뽑음
             # idx2 = score.masked_fill(parity, float('-inf')).topk(k2, dim=1).indices # parity가 true인거 뽑지 않음
             keep_idx = score.masked_fill(parity, float('inf')).topk(k).indices
-            print("k:", k)
-            print("score: ", score.shape)
-            print("parity: ", parity.shape)
+            # print("k:", k)
+            # print("score: ", score.shape)
+            # print("parity: ", parity.shape)
             # print("idx1: ", idx1.shape)
             # print("idx2: ", idx2.shape)
-            print("keep_idx: ", keep_idx.shape)
+            # print("keep_idx: ", keep_idx.shape)
             # print("keep_idx: ", torch.cat([idx1, idx2], dim=1).shape)
             self.k = k
             self.score = score
