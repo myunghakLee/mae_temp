@@ -123,8 +123,8 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         # mask_0 = (i_idx + j_idx) % 2  # checkerboard pattern
         # mask_1 = 1 - mask_0
 
-        self.state_vectors = torch.nn.Linear(self.d_model, self.dynamic_pooling_codebook_size)
-        self.sos = torch.nn.Parameter(torch.rand(embed_dim), requires_grad=True)  # 시작 토큰
+        # self.state_vectors = torch.nn.Linear(self.d_model, self.dynamic_pooling_codebook_size)
+        # self.sos = torch.nn.Parameter(torch.rand(embed_dim), requires_grad=True)  # 시작 토큰
         # self.energy_threshold = torch.tensor(0.0)
         self.register_buffer("energy_threshold", torch.tensor(0.0), persistent=True)
         self.register_token = nn.Parameter(torch.rand(self.d_model), requires_grad=True) 
@@ -188,7 +188,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         pred = pred_2d.permute(0, 2, 3, 1).reshape(B, L, D)
 
         cos = F.cosine_similarity(x.float(), pred.float(), dim=-1)
-        rec_loss = (1.0 - cos).mean() + F.l1_loss(pred, x, reduction='mean')
+        rec_loss = (1.0 - cos) + F.l1_loss(pred, x, reduction='none').mean(-1)
 
         return rec_loss, cos
 
@@ -218,17 +218,32 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             parity = self.checker_masking[random.randint(0,1)].unsqueeze(0)
             # keep_ratio -=  len(keep_idx) / len(energy[0])
             assert keep_ratio >= 0.5, f"mask_ratio must be smaller than 0.5, got {self.mask_ratio}"
-            k1 = k // 2
-            k2 = k - k1
-            idx1 = score.masked_fill(parity, float('inf')).topk(k1, dim=1).indices  # parity가 true인거 다뽑음
-            idx2 = score.masked_fill(parity, float('-inf')).topk(k2, dim=1).indices # parity가 true인거 뽑지 않음
-            keep_idx = torch.cat([idx1, idx2], dim=1)                          # [B, k]
+            # k1 = k // 2
+            # k2 = k - k1
+            # idx1 = score.masked_fill(parity, float('inf')).topk(k1, dim=1).indices  # parity가 true인거 다뽑음
+            # idx2 = score.masked_fill(parity, float('-inf')).topk(k2, dim=1).indices # parity가 true인거 뽑지 않음
+            keep_idx = score.masked_fill(parity, float('inf')).topk(k).indices
+            print("k:", k)
+            print("score: ", score.shape)
+            print("parity: ", parity.shape)
+            # print("idx1: ", idx1.shape)
+            # print("idx2: ", idx2.shape)
+            print("keep_idx: ", keep_idx.shape)
+            # print("keep_idx: ", torch.cat([idx1, idx2], dim=1).shape)
+            self.k = k
+            self.score = score
+            self.parity = parity
+            # self.idx1 = idx1
+            # self.idx2 = idx2
+
+            # keep_idx = torch.cat([idx1, idx2], dim=1)                          # [B, k]
 
         else:
             keep_idx = score.topk(k, dim=1).indices
 
         x_kept = torch.gather(x, 1, keep_idx.unsqueeze(-1).expand(B, k, D))
-
+        rec_loss = rec_loss.mean()
+        print("rec_loss: ", rec_loss)
         return x_kept, keep_idx, rec_loss, cos
 
 
