@@ -1,7 +1,8 @@
 import timm.models.vision_transformer as timm_vit
-import math
 import torch.nn.functional as F
+import math
 eps = 1e-6
+
 # --- timm Attention 상속: Q, K, V 외부 입력 지원 ---
 class CustomAttention(timm_vit.Attention):
     def forward(self, x, q_input=None, k_input=None, v_input=None):
@@ -133,7 +134,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         # Ver 2: Using MAE Loss using Conv Layer
         self.mae_loss = nn.MSELoss(reduction='none')
         # self.pred_conv = torch.nn.Conv2d(self.d_model, self.d_model, kernel_size=3, stride=1, padding=1)
-        self.pred_conv = torch.nn.Conv2d(self.d_model, self.d_model, kernel_size=3, stride=1, padding=1, bias = False)  # TODO: 이 부분 bias=False로 놓는것이 맞는지 체크
+        self.pred_conv = torch.nn.Conv2d(self.d_model, self.d_model, kernel_size=3, stride=1, padding="reflect", bias = False)  # TODO: 이 부분 bias=False로 놓는것이 맞는지 체크
         weight_mask = torch.ones_like(self.pred_conv.weight)
         weight_mask[..., 1, 1] = 0
 
