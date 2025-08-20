@@ -224,7 +224,8 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             # k2 = k - k1
             # idx1 = score.masked_fill(parity, float('inf')).topk(k1, dim=1).indices  # parity가 true인거 다뽑음
             # idx2 = score.masked_fill(parity, float('-inf')).topk(k2, dim=1).indices # parity가 true인거 뽑지 않음
-            keep_idx = score.masked_fill(parity, float('inf')).topk(k).indices
+            with torch.no_grad():
+                keep_idx = score.masked_fill(parity, float('inf')).topk(k).indices
             # print("k:", k)
             # print("score: ", score.shape)
             # print("parity: ", parity.shape)
