@@ -242,7 +242,8 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             # keep_idx = torch.cat([idx1, idx2], dim=1)                          # [B, k]
 
         else:
-            keep_idx = score.topk(k, dim=1).indices
+            with torch.no_grad():
+                keep_idx = score.topk(k, dim=1).indices
 
         x_kept = torch.gather(x, 1, keep_idx.unsqueeze(-1).expand(B, k, D))
         rec_loss = rec_loss.mean()
