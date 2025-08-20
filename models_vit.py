@@ -194,6 +194,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         return rec_loss, cos
 
     def energy_based_masking(self, x):
+
         # print("x shape: ", x.shape)  # batch_num, patch_num, emb_dim
         """
         패치별 energy based 마스킹 수행 (MAE 스타일)
@@ -207,7 +208,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         B, L, D = x.shape  # batch, length, dim
         keep_ratio = 1.0 - self.mask_ratio
         k = max(1, int(round(L * keep_ratio)))
-        rec_loss, cos = self.calc_energy(x)
+        rec_loss, cos = self.calc_energy(x.detach())
 
         score = rec_loss
 
