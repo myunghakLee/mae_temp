@@ -68,6 +68,28 @@ class MulMask(nn.Module):
         return W * self.mask
 
 
+class NormalizeMaskedKernel(nn.Module):
+    """
+    [제안사항] 볼록 결합(비음수·합=1)을 강제하는 파라미터라이즈.
+    - depthwise 3x3 conv의 각 채널별 커널에 대해:
+      1) softplus로 비음수화
+      2) center=0 마스크 적용
+      3) 나머지 8개 이웃 가중치의 합이 1이 되도록 정규화
+    이렇게 하면 '이웃 평균의 가중치판'이라는 해석이 유지되고 과도한 표현력을 억제한다.
+    """
+    def __init__(self, mask, eps: float = 1e-12):
+        super().__init__()
+        self.register_buffer("mask", mask)
+        self.eps = eps
+    def forward(self, W):
+        # W: (D, 1, 3, 3) for depthwise
+        Wp = F.softplus(W)                 # 비음수
+        Wp = Wp * self.mask                # center=0 유지
+        s = Wp.sum((2, 3), keepdim=True).clamp_min(self.eps)  # 이웃 합
+        Wn = (Wp / s) * self.mask          # 합=1 정규화
+        return Wn
+
+
 class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
     """ Vision Transformer with support for global average pooling and custom QKV input """
     def __init__(self, global_pool=False, mask_ratio=0.0, **kwargs):
@@ -134,12 +156,29 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         # Ver 2: Using MAE Loss using Conv Layer
         self.mae_loss = nn.MSELoss(reduction='none')
         # self.pred_conv = torch.nn.Conv2d(self.d_model, self.d_model, kernel_size=3, stride=1, padding=1)
-        self.pred_conv = torch.nn.Conv2d(self.d_model, self.d_model, kernel_size=3, stride=1, padding=1, padding_mode='replicate', bias = False)  # TODO: 이 부분 bias=False로 놓는것이 맞는지 체크
+        self.pred_conv = torch.nn.Conv2d(
+            self.d_model, self.d_model, kernel_size=3, stride=1, padding=1,
+            padding_mode='reflect', bias=False, groups=self.d_model
+        )  # TODO: 이 부분 bias=False로 놓는것이 맞는지 체크
+        weight_mask = torch.ones_like(self.pred_conv.weight)
         weight_mask = torch.ones_like(self.pred_conv.weight)
         weight_mask[..., 1, 1] = 0
 
+        # [제안사항] 파라미터라이즈 1: center=0 강제
         parametrize.register_parametrization(self.pred_conv, "weight", MulMask(weight_mask))
 
+        # [제안사항] 파라미터라이즈 2: 비음수·합=1(볼록 결합) 강제
+        #  - 이 단계에서 softplus+정규화로 항상 '이웃 가중치의 합=1' 유지
+        parametrize.register_parametrization(self.pred_conv, "weight", NormalizeMaskedKernel(weight_mask))
+
+        # [제안사항] 8-이웃 평균 초기화 (효과적인 가중치가 1/8이 되도록)
+        with torch.no_grad():
+            self.pred_conv.weight.zero_()        # base 파라미터는 0
+            # NormalizeMaskedKernel을 거치면 softplus(0)=~0.693로 동일값 → 마스크 후 정규화로 1/8
+            # 즉, 별도 채우기 없이 균등 분배가 된다. 필요하면 아래처럼 더 명시적으로도 가능.
+            # for c in range(self.d_model):
+            #     w = self.pred_conv.weight[c, 0]
+            #     w.zero_()
 
 
         # i+j 홀수인 마스크 생성. 단 1자로 쭉 폈을 때 끼준
@@ -156,6 +195,21 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         # # self.energy_func_rl = torch.nn.Linear(self.d_model, self.dynamic_pooling_codebook_size)  # right-left
         
         # # self.kl_loss = nn.KLDivLoss(reduction='none')
+        self.energy_use_zscore = True      # (1-cos), MAE를 패치 차원에서 표준화 후 합산
+        self.pred_conv_warmup_steps = 0    # >0이면 warmup 동안 pred_conv를 사실상 고정(grad off)하고 에너지 분포를 먼저 안정화
+        self.train_pred_conv = True        # True면 warmup 이후 pred_conv 학습 허용
+        self.pred_conv_step = 0            # 내부 스텝 카운터
+
+
+        self.mae_loss = nn.MSELoss(reduction='none')
+
+
+
+    @torch.no_grad()
+    def _tick_pred_conv_step(self):
+        # [제안사항] warmup 스케줄을 위한 내부 스텝 카운터
+        self.pred_conv_step += 1
+
 
     def get_checkerboard_mask(self, flag=0, device=None):
         """
@@ -173,23 +227,44 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         return mask_2d.view(-1)                                      # (W*H,) bool
 
 
-    def calc_energy(self, x): # x shape: batch_num, patch_num, emb_dim
+    def calc_energy(self, x, method = 1, use_zscore=None): # x shape: batch_num, patch_num, emb_dim
+
+        if use_zscore is None:
+            use_zscore = self.energy_use_zscore
+
         B, L, D = x.shape
-
         H_p, W_p = self.patch_H, self.patch_W
-
-
         assert L == H_p * W_p, f"Patch 수 불일치: N={L}, grid={H_p}x{W_p}"
 
-        x_2d = x.reshape(B, H_p, W_p, D).permute(0, 3, 1, 2).contiguous() # (B, N, D) -> (B, D, H_p, W_p)
+        x2d = x.reshape(B, H_p, W_p, D).permute(0, 3, 1, 2).contiguous() # (B, N, D) -> (B, D, H_p, W_p)
 
-        # 패치별 에너지 계산 (MAE 스타일)
+        # [제안사항] warmup 동안에는 pred_conv를 사실상 고정(grad off)하여
+        # 에너지 분포/랭킹의 초기 안정성을 확보할 수 있다.
+        trainable = self.train_pred_conv and self.training and (self.pred_conv_step >= self.pred_conv_warmup_steps)
+        ctx = torch.enable_grad() if trainable else torch.no_grad()
+        with ctx:
+            pred2d = self.pred_conv(x2d)  # (B, D, H_p, W_p)
+        pred = pred2d.permute(0, 2, 3, 1).reshape(B, L, D)
 
-        pred_2d = self.pred_conv(x_2d)  # (B, D, H_p, W_p)
-        pred = pred_2d.permute(0, 2, 3, 1).reshape(B, L, D)
+        x_f = x.float()
+        pred_f = pred.float()
+        cos = F.cosine_similarity(x_f, pred_f, dim=-1, eps=1e-8)   # (B, L)
+        mae = (pred_f - x_f).abs().mean(-1)                        # (B, L)
 
-        cos = F.cosine_similarity(x.float(), pred.float(), dim=-1)
-        rec_loss = (1.0 - cos) + F.l1_loss(pred, x, reduction='none').mean(-1)
+        if use_zscore:
+            # [제안사항] 랭킹 안정화를 위해 (1-cos), MAE를 패치 차원에서 표준화
+            one_minus_cos = 1.0 - cos
+            mean1 = one_minus_cos.mean(dim=1, keepdim=True)
+            std1 = one_minus_cos.std(dim=1, keepdim=True).clamp_min(1e-6)
+            z1 = (one_minus_cos - mean1) / std1
+
+            mean2 = mae.mean(dim=1, keepdim=True)
+            std2 = mae.std(dim=1, keepdim=True).clamp_min(1e-6)
+            z2 = (mae - mean2) / std2
+
+            rec_loss = z1 + z2   # (B, L)
+        else:
+            rec_loss = (1.0 - cos) + mae
 
         return rec_loss, cos
 
@@ -207,7 +282,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         """
         B, L, D = x.shape  # batch, length, dim
         keep_ratio = 1.0 - self.mask_ratio
-        k = max(1, int(round(L * keep_ratio)))
+        k = max(1, int(L * keep_ratio))
         rec_loss, cos = self.calc_energy(x.detach())
 
         score = rec_loss
@@ -311,9 +386,13 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             self.mask_ratio_history = sum(self.mask_ratio_history_list[-20:]) / len(self.mask_ratio_history_list[-20:])  # 평균 mask_ratio
             self.energy_loss_history_list.append(rec_loss.item())  # energy 기록(logging 용)
             self.energy_loss_history = sum(self.energy_loss_history_list[-20:]) / len(self.energy_loss_history_list[-20:])  # 평균 energy
+            # [제안사항] warmup 스텝 카운트
+            if self.training:
+                self._tick_pred_conv_step()
 
         else:
             q = x
+            rec_loss = torch.tensor(0.0, device=x.device)
         # 클래스 토큰 추가
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
         cls_tokens = cls_token.expand(B, -1, -1)
