@@ -384,7 +384,9 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             # print(f"patch : {x.shape} --> {q.shape}")
             self.mask_ratio_history_list.append(1 - patch_length / x.shape[1])  # mask_ratio 기록(logging 용)
             self.mask_ratio_history = sum(self.mask_ratio_history_list[-20:]) / len(self.mask_ratio_history_list[-20:])  # 평균 mask_ratio
-            self.energy_loss_history_list.append(rec_loss.item())  # energy 기록(logging 용)
+            
+            
+            self.energy_loss_history_list.append(rec_loss.item() * 10000000)  # energy 기록(logging 용으로는 너무 작기 때문에 10000000을 곱해줌), loss에는 아무런 영향 없음. 그냥 오로지 로깅 목적.
             self.energy_loss_history = sum(self.energy_loss_history_list[-20:]) / len(self.energy_loss_history_list[-20:])  # 평균 energy
             # [제안사항] warmup 스텝 카운트
             if self.training:
