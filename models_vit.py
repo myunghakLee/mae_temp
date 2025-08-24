@@ -128,7 +128,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         ################# For energy-based masking ####################
         self.mask_ratio = mask_ratio
         self.d_model = embed_dim
-        self.dynamic_pooling_codebook_size = int((1-self.mask_ratio) * self.d_model)
+        self.codebook_size = 32
         self.local_minima_constraint = True
         self.use_register = True
         self.dynamic_pooling = True
@@ -146,7 +146,6 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         # mask_0 = (i_idx + j_idx) % 2  # checkerboard pattern
         # mask_1 = 1 - mask_0
 
-        # self.state_vectors = torch.nn.Linear(self.d_model, self.dynamic_pooling_codebook_size)
         # self.sos = torch.nn.Parameter(torch.rand(embed_dim), requires_grad=True)  # 시작 토큰
         # self.energy_threshold = torch.tensor(0.0)
         self.register_buffer("energy_threshold", torch.tensor(0.0), persistent=True)
@@ -157,9 +156,12 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         self.mae_loss = nn.MSELoss(reduction='none')
         # self.pred_conv = torch.nn.Conv2d(self.d_model, self.d_model, kernel_size=3, stride=1, padding=1)
         self.pred_conv = torch.nn.Conv2d(
-            self.d_model, self.d_model, kernel_size=3, stride=1, padding=1,
-            padding_mode='reflect', bias=False, groups=self.d_model
+            self.d_model, self.codebook_size, kernel_size=3, stride=1, padding=1,
+            padding_mode='reflect', bias=False, groups=self.codebook_size
         )  # TODO: 이 부분 bias=False로 놓는것이 맞는지 체크
+
+        self.state_vectors = torch.nn.Linear(self.d_model, self.codebook_size)
+
         weight_mask = torch.ones_like(self.pred_conv.weight)
         weight_mask = torch.ones_like(self.pred_conv.weight)
         weight_mask[..., 1, 1] = 0
@@ -202,7 +204,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
 
         self.mae_loss = nn.MSELoss(reduction='none')
-
+        self.eps = 1e-8
 
 
     @torch.no_grad()
@@ -228,6 +230,10 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
 
     def calc_energy(self, x, method = 1, use_zscore=None): # x shape: batch_num, patch_num, emb_dim
+        B, T_wo, Fdim = x.size()
+        
+        state = self.state_vectors(x.requires_grad_(False))
+        state = torch.nn.functional.softmax(state, dim=-1)  # (B, T, C)
 
         if use_zscore is None:
             use_zscore = self.energy_use_zscore
@@ -244,29 +250,30 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         ctx = torch.enable_grad() if trainable else torch.no_grad()
         with ctx:
             pred2d = self.pred_conv(x2d)  # (B, D, H_p, W_p)
-        pred = pred2d.permute(0, 2, 3, 1).reshape(B, L, D)
+        pred = pred2d.permute(0, 2, 3, 1).reshape(B, L, self.codebook_size)
 
         x_f = x.float()
         pred_f = pred.float()
-        cos = F.cosine_similarity(x_f, pred_f, dim=-1, eps=1e-8)   # (B, L)
-        mae = (pred_f - x_f).abs().mean(-1)                        # (B, L)
+
+
+        # cos = F.cosine_similarity(x_f, pred_f, dim=-1, eps=1e-8)   # (B, L)
+        # mae = (pred_f - x_f).abs().mean(-1)                        # (B, L)
 
         if use_zscore:
+            state_avg = torch.sum(state, dim=-1) / (T_wo + self.eps)
+            state_pred = torch.nn.functional.softmax(pred, dim=-1)
             # [제안사항] 랭킹 안정화를 위해 (1-cos), MAE를 패치 차원에서 표준화
-            one_minus_cos = 1.0 - cos
-            mean1 = one_minus_cos.mean(dim=1, keepdim=True)
-            std1 = one_minus_cos.std(dim=1, keepdim=True).clamp_min(1e-6)
-            z1 = (one_minus_cos - mean1) / std1
+            entropy_maximization_loss = torch.sum(state_avg * torch.log(state_avg + self.eps), dim=-1)
+            state_prediction_loss = torch.sum(-state * torch.log(state_pred + self.eps), dim = -1)
 
-            mean2 = mae.mean(dim=1, keepdim=True)
-            std2 = mae.std(dim=1, keepdim=True).clamp_min(1e-6)
-            z2 = (mae - mean2) / std2
+            entropy_maximization_loss = entropy_maximization_loss.sum()
+            state_prediction_loss = state_prediction_loss.sum(-1).mean()
 
-            rec_loss = z1 + z2   # (B, L)
+            rec_loss =  state_prediction_loss + 2 * entropy_maximization_loss
         else:
-            rec_loss = (1.0 - cos) + mae
+            rec_loss = 0
 
-        return rec_loss, cos
+        return rec_loss, None
 
     def energy_based_masking(self, x):
 
@@ -431,6 +438,11 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             losses['entropy_maximization_loss'] = self.entropy_maximization_loss.mean()
         return losses
     
+    def get_energy_function_loss(self):
+        self.entropy_maximization_loss = self.entropy_maximization_loss.sum()
+        self.state_prediction_loss = self.state_prediction_loss.sum()
+        return self.entropy_maximization_loss + self.state_prediction_loss
+
     def forward(self, x):
         """
         Vision Transformer 순전파 (마스킹 지원)
@@ -446,6 +458,8 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         # 분류 헤드 통과
         x = self.head(x)
         return x, rec_loss
+
+
 
 
 def vit_base_patch16(**kwargs):
