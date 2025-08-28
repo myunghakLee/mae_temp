@@ -209,7 +209,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         self.linear_q = torch.nn.Linear(embed_dim, 64)
         self.linear_k = torch.nn.Linear(embed_dim, 64)
 
-        batch_size = 4  # TODO: change dynamically
+        batch_size = 1024  # TODO: change dynamically
         x_axis_size = 14  # TODO: change dynamically
         att_context_size = 1
 
