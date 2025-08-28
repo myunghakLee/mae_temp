@@ -1,18 +1,29 @@
 import timm.models.vision_transformer as timm_vit
+import torch.nn.utils.parametrize as parametrize
+import timm.models.vision_transformer
 import torch.nn.functional as F
+import torch.nn as nn
+import torch
+
+from functools import partial
+import random
 import math
+
 eps = 1e-6
+
 
 # --- timm Attention 상속: Q, K, V 외부 입력 지원 ---
 class CustomAttention(timm_vit.Attention):
     def forward(self, x, q_input=None, k_input=None, v_input=None):
         # x: [B, N, C] (기존과 동일)
         # q_input, k_input, v_input: [B, N, C] (optional)
-        B, N, C = x.shape
         if q_input is None or k_input is None or v_input is None:
             # 기존 timm 방식: x에서 qkv 생성
             return super().forward(x)
         # q, k, v를 외부에서 입력받아 사용
+
+        B, N, C = x.shape
+
         q = self.qkv(q_input)[:, :, :C]
         k = self.qkv(k_input)[:, :, C:2*C]
         v = self.qkv(v_input)[:, :, 2*C:]
@@ -50,14 +61,6 @@ class CustomBlock(timm_vit.Block):
 # timm: https://github.com/rwightman/pytorch-image-models/tree/master/timm
 # DeiT: https://github.com/facebookresearch/deit
 # --------------------------------------------------------
-
-from functools import partial
-import torch
-import torch.nn as nn
-import timm.models.vision_transformer
-import random
-import torch.nn.utils.parametrize as parametrize
-import torch.nn.functional as F
 
 
 class MulMask(nn.Module):
@@ -128,7 +131,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         ################# For energy-based masking ####################
         self.mask_ratio = mask_ratio
         self.d_model = embed_dim
-        self.codebook_size = 32
+        self.codebook_size = 64
         self.local_minima_constraint = True
         self.use_register = True
         self.dynamic_pooling = True
@@ -162,7 +165,6 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
         self.state_vectors = torch.nn.Linear(self.d_model, self.codebook_size)
 
-        weight_mask = torch.ones_like(self.pred_conv.weight)
         weight_mask = torch.ones_like(self.pred_conv.weight)
         weight_mask[..., 1, 1] = 0
 
@@ -203,10 +205,28 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         self.pred_conv_step = 0            # 내부 스텝 카운터
 
 
-        self.mae_loss = nn.MSELoss(reduction='none')
         self.eps = 1e-8
+        self.linear_q = torch.nn.Linear(embed_dim, 64)
+        self.linear_k = torch.nn.Linear(embed_dim, 64)
 
+        batch_size = 4  # TODO: change dynamically
+        x_axis_size = 14  # TODO: change dynamically
+        att_context_size = 1
 
+        att_mask = torch.ones(batch_size, x_axis_size*x_axis_size, x_axis_size*x_axis_size)
+        att_mask = att_mask.triu(diagonal=-att_context_size)
+        att_mask = att_mask.tril(diagonal=att_context_size)
+
+        att_mask_a = torch.ones(batch_size, x_axis_size*x_axis_size, x_axis_size*x_axis_size)
+        att_mask_a = att_mask_a.triu(diagonal=-att_context_size*x_axis_size)
+        att_mask_a = att_mask_a.tril(diagonal=att_context_size*x_axis_size)
+
+        att_mask_b = torch.ones(batch_size, x_axis_size*x_axis_size, x_axis_size*x_axis_size)
+        att_mask_b = att_mask_b.triu(diagonal=-x_axis_size)
+        att_mask_b = att_mask_b.tril(diagonal=x_axis_size)
+
+        self.att_mask = att_mask_a + att_mask_b + att_mask
+        self.att_mask_device = False
     @torch.no_grad()
     def _tick_pred_conv_step(self):
         # [제안사항] warmup 스케줄을 위한 내부 스텝 카운터
@@ -263,17 +283,14 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             state_avg = torch.sum(state, dim=-1) / (T_wo + self.eps)
             state_pred = torch.nn.functional.softmax(pred, dim=-1)
             # [제안사항] 랭킹 안정화를 위해 (1-cos), MAE를 패치 차원에서 표준화
-            entropy_maximization_loss = torch.sum(state_avg * torch.log(state_avg + self.eps), dim=-1)
-            state_prediction_loss = torch.sum(-state * torch.log(state_pred + self.eps), dim = -1)
+            entropy_maximization_loss = torch.sum(state_avg * torch.log(state_avg + self.eps), dim=-1) # (B,)
+            state_prediction_loss = torch.sum(-state * torch.log(state_pred + self.eps), dim = -1)  # (B, L)
 
-            entropy_maximization_loss = entropy_maximization_loss.sum()
-            state_prediction_loss = state_prediction_loss.sum(-1).mean()
-
-            rec_loss =  state_prediction_loss + 2 * entropy_maximization_loss
+            loss =  state_prediction_loss.sum(-1).mean() + 2 * entropy_maximization_loss.sum()
         else:
-            rec_loss = 0
+            loss = 0
 
-        return rec_loss, None
+        return loss, state_prediction_loss
 
     def energy_based_masking(self, x):
 
@@ -290,38 +307,22 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         B, L, D = x.shape  # batch, length, dim
         keep_ratio = 1.0 - self.mask_ratio
         k = max(1, int(L * keep_ratio))
-        rec_loss, cos = self.calc_energy(x.detach())
+        rec_loss, state_prediction_loss = self.calc_energy(x.detach())
 
-        score = rec_loss
-
+        score = state_prediction_loss
+        
 
         if self.local_minima_constraint:
-            if not self.device:
+            if self.device is None:
                 self.device = score.device
                 self.checker_masking = self.checker_masking.to(device=self.device)
             parity = self.checker_masking[random.randint(0,1)].unsqueeze(0)
-            # keep_ratio -=  len(keep_idx) / len(energy[0])
-            assert keep_ratio >= 0.5, f"mask_ratio must be smaller than 0.5, got {self.mask_ratio}"
-            # k1 = k // 2
-            # k2 = k - k1
-            # idx1 = score.masked_fill(parity, float('inf')).topk(k1, dim=1).indices  # parity가 true인거 다뽑음
-            # idx2 = score.masked_fill(parity, float('-inf')).topk(k2, dim=1).indices # parity가 true인거 뽑지 않음
-            with torch.no_grad():
-                keep_idx = score.masked_fill(parity, float('inf')).topk(k).indices
-            # print("k:", k)
-            # print("score: ", score.shape)
-            # print("parity: ", parity.shape)
-            # print("idx1: ", idx1.shape)
-            # print("idx2: ", idx2.shape)
-            # print("keep_idx: ", keep_idx.shape)
-            # print("keep_idx: ", torch.cat([idx1, idx2], dim=1).shape)
-            self.k = k
-            self.score = score
-            self.parity = parity
-            # self.idx1 = idx1
-            # self.idx2 = idx2
 
-            # keep_idx = torch.cat([idx1, idx2], dim=1)                          # [B, k]
+            assert keep_ratio >= 0.5, f"mask_ratio must be smaller than 0.5, got {self.mask_ratio}"
+
+            with torch.no_grad():
+                keep_idx = score.masked_fill(parity, float('inf')).topk(k).indices  # 우선 이웃한게 제거되는것을 막기 위해 i+j가 홀수인부분(혹은 짝수인부분)은 무조건 inf로 채워 keep을 진행
+
 
         else:
             with torch.no_grad():
@@ -329,7 +330,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
         x_kept = torch.gather(x, 1, keep_idx.unsqueeze(-1).expand(B, k, D))
         rec_loss = rec_loss.mean()
-        return x_kept, keep_idx, rec_loss, cos
+        return x_kept, keep_idx, rec_loss
 
 
 
@@ -378,22 +379,55 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         """
         B = x.shape[0]
         x = self.patch_embed(x) # (4, 196, 768)
-        x = x + self.pos_embed[:, 1:, :]
+        x = x + self.pos_embed[:, 1:, :]   # TODO: pos_embed 나중에 더해주기
         # mask_ratio = 0.2
+
         if self.mask_ratio > 0:
             # q, _, _ = self.random_masking(x, mask_ratio)
             # energy = torch.zeros_like(q)
-            q, keep_idx, rec_loss, cos = self.energy_based_masking(x)
+            q, keep_idx, rec_loss = self.energy_based_masking(x)
             patch_length = q.shape[1]
-            if self.use_register:
-                register_token = self.register_token.unsqueeze(0).unsqueeze(1).repeat(q.size(0), 1, 1) 
-                q = torch.cat([register_token, q], dim=1)
+
+            state_to_remain = x.size(1) - int(self.mask_ratio * x.size(1))
+            if not self.att_mask_device:
+                self.att_mask = self.att_mask.to(x.device)
+                self.att_mask_device = True
+
+            att_mask = self.att_mask.gather(1, keep_idx.unsqueeze(-1).expand(-1, -1, self.att_mask.size(-1)))  # (B, T', T)
+            att_mask = torch.cat([torch.zeros((att_mask.size(0), att_mask.size(1), 1), device = att_mask.device, dtype = att_mask.dtype), att_mask], dim=2)  # (B, T', T + 1)
+            att_mask = torch.cat([torch.ones((att_mask.size(0), 1, att_mask.size(2)), device = att_mask.device, dtype = att_mask.dtype), att_mask], dim=1)  # (B, T' + 1, T + 1)
+
+            # 클래스 토큰 추가
+            cls_token = self.cls_token + self.pos_embed[:, :1, :]
+            cls_tokens = cls_token.expand(B, -1, -1)
+
+            x = torch.cat((cls_tokens, x), dim=1)
+            q = torch.cat((cls_tokens, q), dim=1)
+
+            q = self.linear_q(q)
+            k = self.linear_k(x)
+
+
+            # print("q: ", q.shape)
+            # print("k: ", k.shape)
+            # print("x: ", x.shape)
+            # print("self.att_mask: ", self.att_mask.shape) # B, L, L
+            # print("=" * 400)
+
+            attn = torch.matmul(q, k.transpose(-2, -1)) / (k.size(-1)**0.5)  # (B, T' + 1, T + 1)
+            attn = attn.masked_fill((att_mask==0), float('-inf'))   # masked attention score (B, T' + 1, T + 1)
+            attn = attn.softmax(dim=-1)
+            x = torch.matmul(attn, x)                # (B, T' + 1, F)
+
+
+            # if self.use_register:
+            #     register_token = self.register_token.unsqueeze(0).unsqueeze(1).repeat(q.size(0), 1, 1) 
+            #     q = torch.cat([register_token, q], dim=1)
             # print(f"patch : {x.shape} --> {q.shape}")
             self.mask_ratio_history_list.append(1 - patch_length / x.shape[1])  # mask_ratio 기록(logging 용)
             self.mask_ratio_history = sum(self.mask_ratio_history_list[-20:]) / len(self.mask_ratio_history_list[-20:])  # 평균 mask_ratio
             
-            
-            self.energy_loss_history_list.append(rec_loss.item() * 10000000)  # energy 기록(logging 용으로는 너무 작기 때문에 10000000을 곱해줌), loss에는 아무런 영향 없음. 그냥 오로지 로깅 목적.
+            self.energy_loss_history_list.append(rec_loss.item())  # energy 기록(logging 용으로는 너무 작기 때문에 10000000을 곱해줌), loss에는 아무런 영향 없음. 그냥 오로지 로깅 목적.
             self.energy_loss_history = sum(self.energy_loss_history_list[-20:]) / len(self.energy_loss_history_list[-20:])  # 평균 energy
             # [제안사항] warmup 스텝 카운트
             if self.training:
@@ -402,22 +436,17 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         else:
             q = x
             rec_loss = torch.tensor(0.0, device=x.device)
-        # 클래스 토큰 추가
-        cls_token = self.cls_token + self.pos_embed[:, :1, :]
-        cls_tokens = cls_token.expand(B, -1, -1)
-        
-        q = torch.cat((cls_tokens, q), dim=1)
-        q = self.pos_drop(q)
-        
-        x = torch.cat((cls_tokens, x), dim=1)  # 클래스 토큰 추가
+
         x = self.pos_drop(x)  # 포지션 드롭
         
         # K, V 입력 지정 (없으면 Q와 동일)
 
         # 커스텀 블록 순차 적용
         for blk in self.blocks:
-            q = blk(q, x, x)
-        x = q
+            # q = blk(q, x, x)
+            x = blk(x)
+            # q = x
+
         if self.global_pool:
             x = x[:, 1:, :].mean(dim=1)
             outcome = self.fc_norm(x)
