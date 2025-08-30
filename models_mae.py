@@ -236,8 +236,12 @@ class MaskedAutoencoderViT(nn.Module):
 
         loss = (pred - target) ** 2
         loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
+        if torch.isnan(loss).any():
+            print("NaN detected in loss before masking")
 
-        loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
+        loss = (loss * mask).sum() / (mask.sum() + 1e-6)  # mean loss on removed patches
+        if torch.isnan(loss):
+            print("NaN detected in final loss")
         return loss
 
     def forward(self, imgs, mask_ratio=0.75):

@@ -253,7 +253,18 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         B, T_wo, Fdim = x.size()
         
         state = self.state_vectors(x.requires_grad_(False))
+        
+        # state NaN/Inf 체크
+        if torch.isnan(state).any() or torch.isinf(state).any():
+            print("Warning: NaN/Inf detected in state")
+            state = torch.where(torch.isnan(state) | torch.isinf(state), 0.0, state)
+        
         state = torch.nn.functional.softmax(state, dim=-1)  # (B, T, C)
+        
+        # softmax 후 NaN 체크
+        if torch.isnan(state).any():
+            print("Warning: NaN detected after softmax in state")
+            state = torch.where(torch.isnan(state), 1.0/state.size(-1), state)
 
         if use_zscore is None:
             use_zscore = self.energy_use_zscore
@@ -270,6 +281,12 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         ctx = torch.enable_grad() if trainable else torch.no_grad()
         with ctx:
             pred2d = self.pred_conv(x2d)  # (B, D, H_p, W_p)
+            
+        # pred2d NaN/Inf 체크
+        if torch.isnan(pred2d).any() or torch.isinf(pred2d).any():
+            print("Warning: NaN/Inf detected in pred2d from conv")
+            pred2d = torch.where(torch.isnan(pred2d) | torch.isinf(pred2d), 0.0, pred2d)
+            
         pred = pred2d.permute(0, 2, 3, 1).reshape(B, L, self.codebook_size)
 
         x_f = x.float()
@@ -280,11 +297,32 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         # mae = (pred_f - x_f).abs().mean(-1)                        # (B, L)
 
         if use_zscore:
-            state_avg = torch.sum(state, dim=-1) / (T_wo + self.eps)
+            state_avg = torch.sum(state, dim=1) / (T_wo + self.eps)  # dim=-1 -> dim=1으로 수정
+            # state_avg가 0 이하인 경우 처리
+            state_avg = torch.clamp(state_avg, min=self.eps)  # 최소값을 eps로 제한
+            
             state_pred = torch.nn.functional.softmax(pred, dim=-1)
+            # state_pred도 0이 되지 않도록 클램핑
+            state_pred = torch.clamp(state_pred, min=self.eps, max=1.0-self.eps)
+            
+            # NaN 체크 추가
+            if torch.isnan(state_avg).any():
+                print(f"Warning: NaN in state_avg, replacing with eps")
+                state_avg = torch.where(torch.isnan(state_avg), self.eps, state_avg)
+            
+            if torch.isnan(state_pred).any():
+                print(f"Warning: NaN in state_pred, replacing with eps")
+                state_pred = torch.where(torch.isnan(state_pred), self.eps, state_pred)
+            
             # [제안사항] 랭킹 안정화를 위해 (1-cos), MAE를 패치 차원에서 표준화
             entropy_maximization_loss = torch.sum(state_avg * torch.log(state_avg + self.eps), dim=-1) # (B,)
             state_prediction_loss = torch.sum(-state * torch.log(state_pred + self.eps), dim = -1)  # (B, L)
+
+            # loss 계산 전에 NaN 체크
+            if torch.isnan(entropy_maximization_loss).any() or torch.isnan(state_prediction_loss).any():
+                print(f"Warning: NaN in loss components")
+                entropy_maximization_loss = torch.where(torch.isnan(entropy_maximization_loss), 0.0, entropy_maximization_loss)
+                state_prediction_loss = torch.where(torch.isnan(state_prediction_loss), 0.0, state_prediction_loss)
 
             loss =  state_prediction_loss.sum(-1).mean() + 2 * entropy_maximization_loss.sum()
         else:
@@ -311,6 +349,17 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
         score = state_prediction_loss
         
+        # NaN 체크 및 처리
+        if torch.isnan(score).any():
+            print("Warning: NaN detected in score, replacing with zeros")
+            score = torch.where(torch.isnan(score), 0.0, score)
+        
+        # inf 체크 및 처리
+        if torch.isinf(score).any():
+            print("Warning: Inf detected in score, replacing with max finite value")
+            max_finite = torch.finfo(score.dtype).max / 2
+            score = torch.where(torch.isinf(score), max_finite, score)
+        
 
         if self.local_minima_constraint:
             if self.device is None:
@@ -329,7 +378,17 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
                 keep_idx = score.topk(k, dim=1).indices
 
         x_kept = torch.gather(x, 1, keep_idx.unsqueeze(-1).expand(B, k, D))
-        rec_loss = rec_loss.mean()
+        
+        # rec_loss NaN 체크
+        if torch.isnan(rec_loss).any():
+            print("Warning: NaN detected in rec_loss, setting to 0")
+            rec_loss = torch.tensor(0.0, device=x.device)
+        elif torch.isinf(rec_loss).any():
+            print("Warning: Inf detected in rec_loss, setting to 0") 
+            rec_loss = torch.tensor(0.0, device=x.device)
+        else:
+            rec_loss = rec_loss.mean()
+            
         return x_kept, keep_idx, rec_loss
 
 
@@ -416,7 +475,21 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
             attn = torch.matmul(q, k.transpose(-2, -1)) / (k.size(-1)**0.5)  # (B, T' + 1, T + 1)
             attn = attn.masked_fill((att_mask==0), float('-inf'))   # masked attention score (B, T' + 1, T + 1)
+            
+            # softmax 전에 모든 값이 -inf인지 체크
+            mask_all_inf = torch.all(attn == float('-inf'), dim=-1, keepdim=True)
+            if mask_all_inf.any():
+                print("Warning: All attention weights are -inf, setting to uniform distribution")
+                # -inf인 행에 대해서는 uniform distribution으로 대체
+                attn = torch.where(mask_all_inf, 0.0, attn)
+            
             attn = attn.softmax(dim=-1)
+            
+            # NaN 체크
+            if torch.isnan(attn).any():
+                print("Warning: NaN in attention weights, replacing with uniform")
+                attn = torch.where(torch.isnan(attn), 1.0/attn.size(-1), attn)
+            
             x = torch.matmul(attn, x)                # (B, T' + 1, F)
 
 
