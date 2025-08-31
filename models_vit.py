@@ -80,17 +80,22 @@ class NormalizeMaskedKernel(nn.Module):
       3) 나머지 8개 이웃 가중치의 합이 1이 되도록 정규화
     이렇게 하면 '이웃 평균의 가중치판'이라는 해석이 유지되고 과도한 표현력을 억제한다.
     """
-    def __init__(self, mask, eps: float = 1e-12):
+    def __init__(self, mask, eps: float = 1e-6):
         super().__init__()
         self.register_buffer("mask", mask)
         self.eps = eps
     def forward(self, W):
+        W32 = W.float()
+        mask32 = self.mask.float()
+
         # W: (D, 1, 3, 3) for depthwise
-        Wp = F.softplus(W)                 # 비음수
-        Wp = Wp * self.mask                # center=0 유지
-        s = Wp.sum((2, 3), keepdim=True).clamp_min(self.eps)  # 이웃 합
-        Wn = (Wp / s) * self.mask          # 합=1 정규화
-        return Wn
+        Wp = F.softplus(W32)                 # 비음수
+        Wp = Wp * mask32                # center=0 유지
+        s = Wp.sum((2, 3), keepdim=True)
+        tiny = torch.finfo(W32.dtype).tiny
+        s = torch.clamp(s, min=tiny)
+        Wn = (Wp / s) * mask32          # 합=1 정규화
+        return Wn.to(W.dtype)  # 원래 dtype으로 복귀
 
 
 class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
@@ -248,6 +253,13 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
         return mask_2d.view(-1)                                      # (W*H,) bool
 
+    def check_finite(self, tag, t):
+        if not torch.isfinite(t).all():
+            bad = t[~torch.isfinite(t)]
+            print(f"[Non-finite] {tag}: dtype={t.dtype}, shape={t.shape}, sample={bad.flatten()[:5]}")
+            return False
+        return True
+
 
     def calc_energy(self, x, method = 1, use_zscore=None): # x shape: batch_num, patch_num, emb_dim
         B, T_wo, Fdim = x.size()
@@ -318,6 +330,9 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             entropy_maximization_loss = torch.sum(state_avg * torch.log(state_avg + self.eps), dim=-1) # (B,)
             state_prediction_loss = torch.sum(-state * torch.log(state_pred + self.eps), dim = -1)  # (B, L)
 
+            self.check_finite("state_prediction_loss", state_prediction_loss)
+            self.check_finite("entropy_maximization_loss", entropy_maximization_loss)
+
             # loss 계산 전에 NaN 체크
             if torch.isnan(entropy_maximization_loss).any() or torch.isnan(state_prediction_loss).any():
                 print(f"Warning: NaN in loss components")
@@ -327,6 +342,7 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             loss =  state_prediction_loss.sum(-1).mean() + 2 * entropy_maximization_loss.sum()
         else:
             loss = 0
+        self.check_finite("loss", loss)
 
         return loss, state_prediction_loss
 
@@ -389,6 +405,9 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         else:
             rec_loss = rec_loss.mean()
             
+
+        self.check_finite("rec_loss", rec_loss)
+
         return x_kept, keep_idx, rec_loss
 
 
@@ -472,18 +491,26 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             # print("x: ", x.shape)
             # print("self.att_mask: ", self.att_mask.shape) # B, L, L
             # print("=" * 400)
-
             attn = torch.matmul(q, k.transpose(-2, -1)) / (k.size(-1)**0.5)  # (B, T' + 1, T + 1)
-            attn = attn.masked_fill((att_mask==0), float('-inf'))   # masked attention score (B, T' + 1, T + 1)
+
+            mask = (att_mask != 0)
+            attn = attn.masked_fill(~mask, torch.finfo(attn.dtype).min)
+            attn = F.softmax(attn.float(), dim=-1)
+            attn = torch.nan_to_num(attn, nan=1.0/attn.size(-1))  # 혹시 모를 NaN row 정규화
+            attn = attn.to(q.dtype)
+
+
+
+            # attn = attn.masked_fill((att_mask==0), float('-inf'))   # masked attention score (B, T' + 1, T + 1)
             
-            # softmax 전에 모든 값이 -inf인지 체크
-            mask_all_inf = torch.all(attn == float('-inf'), dim=-1, keepdim=True)
-            if mask_all_inf.any():
-                print("Warning: All attention weights are -inf, setting to uniform distribution")
-                # -inf인 행에 대해서는 uniform distribution으로 대체
-                attn = torch.where(mask_all_inf, 0.0, attn)
+            # # softmax 전에 모든 값이 -inf인지 체크
+            # mask_all_inf = torch.all(attn == float('-inf'), dim=-1, keepdim=True)
+            # if mask_all_inf.any():
+            #     print("Warning: All attention weights are -inf, setting to uniform distribution")
+            #     # -inf인 행에 대해서는 uniform distribution으로 대체
+            #     attn = torch.where(mask_all_inf, 0.0, attn)
             
-            attn = attn.softmax(dim=-1)
+            # attn = attn.softmax(dim=-1)
             
             # NaN 체크
             if torch.isnan(attn).any():
