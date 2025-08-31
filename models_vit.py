@@ -271,6 +271,11 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             print("Warning: NaN/Inf detected in state")
             state = torch.where(torch.isnan(state) | torch.isinf(state), 0.0, state)
         
+        with torch.no_grad():
+            x_stable = x.detach()
+
+        state = self.state_vectors(x_stable)
+        state = torch.clamp(state, min=-10.0, max=10.0)
         state = torch.nn.functional.softmax(state, dim=-1)  # (B, T, C)
         
         # softmax 후 NaN 체크
@@ -293,6 +298,10 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
         ctx = torch.enable_grad() if trainable else torch.no_grad()
         with ctx:
             pred2d = self.pred_conv(x2d)  # (B, D, H_p, W_p)
+            # conv 출력 안정화
+            if torch.isnan(pred2d).any() or torch.isinf(pred2d).any():
+                print("Warning: NaN/Inf detected in pred2d from conv")
+                pred2d = torch.nan_to_num(pred2d, nan=0.0, posinf=1e6, neginf=-1e6)
             
         # pred2d NaN/Inf 체크
         if torch.isnan(pred2d).any() or torch.isinf(pred2d).any():
@@ -301,34 +310,36 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             
         pred = pred2d.permute(0, 2, 3, 1).reshape(B, L, self.codebook_size)
 
-        x_f = x.float()
-        pred_f = pred.float()
-
-
         # cos = F.cosine_similarity(x_f, pred_f, dim=-1, eps=1e-8)   # (B, L)
         # mae = (pred_f - x_f).abs().mean(-1)                        # (B, L)
 
         if use_zscore:
-            state_avg = torch.sum(state, dim=1) / (T_wo + self.eps)  # dim=-1 -> dim=1으로 수정
+            state_avg = torch.mean(state, dim=1, keepdim=False)  # (B, C)  # dim=-1 -> dim=1으로 수정
             # state_avg가 0 이하인 경우 처리
-            state_avg = torch.clamp(state_avg, min=self.eps)  # 최소값을 eps로 제한
+            state_avg = torch.clamp(state_avg, min=self.eps, max=1.0-self.eps)  # 최소값을 eps로 제한
             
-            state_pred = torch.nn.functional.softmax(pred, dim=-1)
-            # state_pred도 0이 되지 않도록 클램핑
+            # softmax 안정화
+            pred_clamped = torch.clamp(pred, min=-10.0, max=10.0)
+            state_pred = torch.nn.functional.softmax(pred_clamped, dim=-1)
             state_pred = torch.clamp(state_pred, min=self.eps, max=1.0-self.eps)
             
-            # NaN 체크 추가
-            if torch.isnan(state_avg).any():
-                print(f"Warning: NaN in state_avg, replacing with eps")
-                state_avg = torch.where(torch.isnan(state_avg), self.eps, state_avg)
-            
-            if torch.isnan(state_pred).any():
-                print(f"Warning: NaN in state_pred, replacing with eps")
-                state_pred = torch.where(torch.isnan(state_pred), self.eps, state_pred)
+            # log 계산 안정화
+            log_state_avg = torch.log(state_avg + self.eps)
+            log_state_pred = torch.log(state_pred + self.eps)
+
+            # NaN 체크
+            if torch.isnan(log_state_avg).any() or torch.isnan(log_state_pred).any():
+                print(f"Warning: NaN in log calculations")
+                log_state_avg = torch.nan_to_num(log_state_avg, nan=0.0)
+                log_state_pred = torch.nan_to_num(log_state_pred, nan=0.0)
             
             # [제안사항] 랭킹 안정화를 위해 (1-cos), MAE를 패치 차원에서 표준화
-            entropy_maximization_loss = torch.sum(state_avg * torch.log(state_avg + self.eps), dim=-1) # (B,)
-            state_prediction_loss = torch.sum(-state * torch.log(state_pred + self.eps), dim = -1)  # (B, L)
+            entropy_maximization_loss = torch.sum(state_avg * log_state_avg, dim=-1)  # (B,)
+            state_prediction_loss = -torch.sum(state * log_state_pred, dim=-1)  # (B, L)
+
+            # 최종 안정화
+            entropy_maximization_loss = torch.clamp(entropy_maximization_loss, min=-1e6, max=1e6)
+            state_prediction_loss = torch.clamp(state_prediction_loss, min=-1e6, max=1e6)
 
             self.check_finite("state_prediction_loss", state_prediction_loss)
             self.check_finite("entropy_maximization_loss", entropy_maximization_loss)
@@ -410,8 +421,6 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
 
         return x_kept, keep_idx, rec_loss
 
-
-
     def random_masking(self, x, mask_ratio):
         """
         패치별 랜덤 마스킹 수행 (MAE 스타일)
@@ -465,6 +474,8 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             # energy = torch.zeros_like(q)
             q, keep_idx, rec_loss = self.energy_based_masking(x)
             patch_length = q.shape[1]
+            self.mask_ratio_history_list.append(1 - patch_length / x.shape[1])  # mask_ratio 기록(logging 용)
+            self.mask_ratio_history = sum(self.mask_ratio_history_list[-20:]) / (len(self.mask_ratio_history_list[-20:]) + 1e-6)  # 평균 mask_ratio
 
             state_to_remain = x.size(1) - int(self.mask_ratio * x.size(1))
             if not self.att_mask_device:
@@ -524,8 +535,6 @@ class VisionTransformer(timm.models.vision_transformer.VisionTransformer):
             #     register_token = self.register_token.unsqueeze(0).unsqueeze(1).repeat(q.size(0), 1, 1) 
             #     q = torch.cat([register_token, q], dim=1)
             # print(f"patch : {x.shape} --> {q.shape}")
-            self.mask_ratio_history_list.append(1 - patch_length / x.shape[1])  # mask_ratio 기록(logging 용)
-            self.mask_ratio_history = sum(self.mask_ratio_history_list[-20:]) / len(self.mask_ratio_history_list[-20:])  # 평균 mask_ratio
             
             self.energy_loss_history_list.append(rec_loss.item())  # energy 기록(logging 용으로는 너무 작기 때문에 10000000을 곱해줌), loss에는 아무런 영향 없음. 그냥 오로지 로깅 목적.
             self.energy_loss_history = sum(self.energy_loss_history_list[-20:]) / len(self.energy_loss_history_list[-20:])  # 평균 energy

@@ -57,15 +57,34 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         with torch.cuda.amp.autocast():
             outputs, rec_loss = model(samples)
             loss = criterion(outputs, targets)
-            
+            if not math.isfinite(loss):
+                print("Loss is {}, stopping training".format(loss_value))
+                has_nan = torch.isnan(outputs).any().item()
+                num_nan = torch.isnan(outputs).sum().item()
+                print("Outputs contain NaN: {}, num_nan: {}".format(has_nan, num_nan))
+
+                import json
+                with open("output.json", "w") as f:
+                    json.dump({"loss": loss.item(), "has_nan": has_nan, "num_nan": num_nan, "outputs" : outputs.detach().cpu().numpy().tolist()}, f)
+                sys.exit(1)
+
             # Energy loss들을 메인 loss에 추가 (작은 가중치)
             energy_loss_weight = 1e-1
+            if not math.isfinite(loss):
+                print("Loss is {}, stopping training".format(loss))
+
+                sys.exit(1)
             loss = loss + energy_loss_weight * rec_loss
+
 
         loss_value = loss.item()
 
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value))
+
+
+            with open("output.json", "w") as f:
+                json.dump({"loss": loss.item(), "outputs" : outputs.detach().cpu().numpy().tolist(), "rec_loss": rec_loss.item()}, f)
             sys.exit(1)
 
         loss /= accum_iter
