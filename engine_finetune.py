@@ -69,7 +69,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                 sys.exit(1)
 
             # Energy loss들을 메인 loss에 추가 (작은 가중치)
-            energy_loss_weight = 1e-1
+            energy_loss_weight = 1e-4
             if not math.isfinite(loss):
                 print("Loss is {}, stopping training".format(loss))
 
