@@ -156,7 +156,7 @@ def evaluate(data_loader, model, device):
             output, rec_loss = model(images)
             loss = criterion(output, target)
             
-            energy_loss_weight = 1e-1
+            energy_loss_weight = 1e-4
             loss = loss + energy_loss_weight * rec_loss
 
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
